@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -452,7 +453,6 @@ class _CameraScreenState extends State<CameraScreen> {
       _showMessage(
         'The recognition model is still loading.',
       );
-
       return;
     }
 
@@ -463,7 +463,17 @@ class _CameraScreenState extends State<CameraScreen> {
       _showMessage(
         'The camera is not ready yet.',
       );
+      return;
+    }
 
+    // Keep a copy of the latest MediaPipe landmarks.
+    // We need these to locate the hand inside the captured photo.
+    final handsForCrop = List<Hand>.from(_detectedHands);
+
+    if (handsForCrop.isEmpty) {
+      _showMessage(
+        'No hand detected. Place your hand inside the guide first.',
+      );
       return;
     }
 
@@ -472,8 +482,9 @@ class _CameraScreenState extends State<CameraScreen> {
       _prediction = '';
       _confidence = 0.0;
       _statusMessage = 'Recognizing...';
-      _detectedHands = [];
-      _handDetected = false;
+
+      // Do NOT clear the landmarks yet.
+      // They are needed to calculate the hand crop.
     });
 
     try {
@@ -489,8 +500,7 @@ class _CameraScreenState extends State<CameraScreen> {
       // Capture a single image.
       // ----------------------------------------------------------
 
-      final XFile photo =
-          await controller.takePicture();
+      final XFile photo = await controller.takePicture();
 
       // ----------------------------------------------------------
       // Read captured image.
@@ -513,18 +523,41 @@ class _CameraScreenState extends State<CameraScreen> {
       }
 
       // ----------------------------------------------------------
-      // Fix orientation.
+      // Fix camera orientation.
       // ----------------------------------------------------------
 
       final oriented =
           img.bakeOrientation(decoded);
 
+      debugPrint(
+        'Captured image: '
+        '${oriented.width} x ${oriented.height}',
+      );
+
       // ----------------------------------------------------------
-      // Prepare image.
+      // Crop around the detected hand.
+      // ----------------------------------------------------------
+
+      final croppedHand = _cropHandFromPhoto(
+        oriented,
+        handsForCrop.first,
+      );
+
+      debugPrint(
+        'Hand crop: '
+        '${croppedHand.width} x ${croppedHand.height}',
+      );
+
+      // ----------------------------------------------------------
+      // Prepare cropped hand for TFLite.
+      //
+      // IMPORTANT:
+      // The TFLite model already contains MobileNetV2
+      // preprocessing, so we send normal 0-255 RGB values.
       // ----------------------------------------------------------
 
       final input =
-          _preprocessPhoto(oriented);
+          _preprocessPhoto(croppedHand);
 
       // ----------------------------------------------------------
       // Model output.
@@ -547,6 +580,11 @@ class _CameraScreenState extends State<CameraScreen> {
       );
 
       final scores = output[0];
+
+      debugPrint(
+        'Prediction scores: '
+        '${scores.map((e) => e.toStringAsFixed(4)).toList()}',
+      );
 
       // ----------------------------------------------------------
       // Find highest score.
@@ -588,9 +626,13 @@ class _CameraScreenState extends State<CameraScreen> {
               'Try placing your hand inside the guide.';
         });
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
       debugPrint(
         'Recognition error: $e',
+      );
+
+      debugPrint(
+        '$stackTrace',
       );
 
       if (!mounted) return;
@@ -610,13 +652,127 @@ class _CameraScreenState extends State<CameraScreen> {
       if (mounted) {
         setState(() {
           _isRecognizing = false;
+          _detectedHands = [];
+          _handDetected = false;
         });
 
         await _startLandmarkStream(controller);
       }
     }
   }
+  // ============================================================
+  // CROP DETECTED HAND FROM PHOTO
+  // ============================================================
 
+  img.Image _cropHandFromPhoto(
+    img.Image source,
+    Hand hand,
+  ) {
+    if (hand.landmarks.isEmpty) {
+      return source;
+    }
+
+    // ----------------------------------------------------------
+    // Find the minimum and maximum normalized landmark positions.
+    //
+    // MediaPipe coordinates are normally:
+    // x = 0.0 ... 1.0
+    // y = 0.0 ... 1.0
+    // ----------------------------------------------------------
+
+    double minX = 1.0;
+    double maxX = 0.0;
+    double minY = 1.0;
+    double maxY = 0.0;
+
+    for (final landmark in hand.landmarks) {
+      minX = math.min(minX, landmark.x);
+      maxX = math.max(maxX, landmark.x);
+      minY = math.min(minY, landmark.y);
+      maxY = math.max(maxY, landmark.y);
+    }
+
+    // ----------------------------------------------------------
+    // Add padding around the hand.
+    //
+    // This prevents fingers from being cut off and gives the
+    // classifier a little surrounding context.
+    // ----------------------------------------------------------
+
+    const double padding = 0.25;
+
+    final double handWidth =
+        maxX - minX;
+
+    final double handHeight =
+        maxY - minY;
+
+    minX -= handWidth * padding;
+    maxX += handWidth * padding;
+
+    minY -= handHeight * padding;
+    maxY += handHeight * padding;
+
+    // ----------------------------------------------------------
+    // Clamp normalized coordinates.
+    // ----------------------------------------------------------
+
+    minX = minX.clamp(0.0, 1.0);
+    maxX = maxX.clamp(0.0, 1.0);
+
+    minY = minY.clamp(0.0, 1.0);
+    maxY = maxY.clamp(0.0, 1.0);
+
+    // ----------------------------------------------------------
+    // Convert normalized coordinates to pixels.
+    // ----------------------------------------------------------
+
+    int left =
+        (minX * source.width).round();
+
+    int top =
+        (minY * source.height).round();
+
+    int right =
+        (maxX * source.width).round();
+
+    int bottom =
+        (maxY * source.height).round();
+
+    // ----------------------------------------------------------
+    // Make sure coordinates are valid.
+    // ----------------------------------------------------------
+
+    left = left.clamp(0, source.width - 1);
+    top = top.clamp(0, source.height - 1);
+
+    right = right.clamp(left + 1, source.width);
+    bottom = bottom.clamp(top + 1, source.height);
+
+    final int cropWidth =
+        right - left;
+
+    final int cropHeight =
+        bottom - top;
+
+    debugPrint(
+      'Hand bounding box: '
+      'left=$left, top=$top, '
+      'width=$cropWidth, height=$cropHeight',
+    );
+
+    // ----------------------------------------------------------
+    // Crop the hand.
+    // ----------------------------------------------------------
+
+    return img.copyCrop(
+      source,
+      x: left,
+      y: top,
+      width: cropWidth,
+      height: cropHeight,
+    );
+  }
   // ============================================================
   // PREPROCESS CAPTURED PHOTO
   // ============================================================
