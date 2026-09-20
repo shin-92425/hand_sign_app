@@ -65,20 +65,28 @@ class _CameraScreenState extends State<CameraScreen> {
   static const int totalFeatures =
       numLandmarks * valuesPerLandmark;
 
-  // Only show a result when confidence reaches 70%.
-  static const double confidenceThreshold = 0.70;
+  // Show a definite result when confidence reaches 70%.
+  // Below that the card says "No clear sign" and the status text names the
+  // closest match, so you can tell "guessing the right sign, low confidence"
+  // apart from "guessing a completely different sign".
+  static const double confidenceThreshold = 0.60;
 
-  // IMPORTANT:
-  // The Python training pipeline used:
+  // The hand_landmarker plugin returns x/y in the camera SENSOR frame
+  // (landscape, not rotated). HandLandmarkPainter rotates them for display;
+  // _landmarksToFeatures() applies the same rotation so the model sees an
+  // UPRIGHT hand, like the Python training pipeline did.
   //
-  // 1. Original x/y/z landmarks
-  // 2. Subtract wrist
-  // 3. Find maximum absolute coordinate
-  // 4. Divide by that scale
-  // 5. Flatten to 63 values
-  //
-  // It did NOT mirror X during normalization.
-  static const bool mirrorLandmarksForModel = false;
+  // We do not know whether the training frames were selfie-mirrored, so when
+  // this is true we score both the on-screen view and its mirror image and keep
+  // the more confident one. All five signs mean the same thing mirrored, and
+  // it also handles left vs right hands.
+  static const bool tryBothOrientations = true;
+
+  // When Capture is pressed, average the model output over the last few
+  // frames instead of trusting a single noisy frame.
+  static const int _historyFrames = 5;
+  static const Duration _historyWindow =
+      Duration(milliseconds: 700);
 
   // ==========================================================================
   // CAMERA
@@ -108,6 +116,9 @@ class _CameraScreenState extends State<CameraScreen> {
   StreamSubscription<List<Hand>>? _landmarkSubscription;
 
   List<Hand> _detectedHands = [];
+
+  // Recent single-hand results (newest last), used to average on capture.
+  final List<_TimedHand> _handHistory = <_TimedHand>[];
 
   bool _handDetected = false;
 
@@ -179,6 +190,18 @@ class _CameraScreenState extends State<CameraScreen> {
         (hands) {
           if (!mounted) {
             return;
+          }
+
+          if (hands.isNotEmpty) {
+            _handHistory.add(
+              _TimedHand(hands.first, DateTime.now()),
+            );
+
+            while (_handHistory.length > 12) {
+              _handHistory.removeAt(0);
+            }
+          } else {
+            _handHistory.clear();
           }
 
           setState(() {
@@ -429,7 +452,7 @@ class _CameraScreenState extends State<CameraScreen> {
   ) async {
     final controller = CameraController(
       camera,
-      ResolutionPreset.high,
+      ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
@@ -567,129 +590,118 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // ==========================================================================
-  // NORMALIZE LANDMARKS
+  // LANDMARKS -> MODEL FEATURES
   //
-  // EXACTLY MATCHES THE PYTHON TRAINING PIPELINE:
-  //
-  // 21 landmarks × 3 = 63 values
-  //
-  // 1. Read x/y/z
-  // 2. Subtract wrist coordinates
-  // 3. Find maximum absolute value
-  // 4. Divide all values by scale
-  // 5. Flatten to 63 values
+  // 1. Convert the plugin's sensor-frame x/y into on-screen (upright) pixel
+  //    coordinates. This is exactly the transform HandLandmarkPainter uses to
+  //    draw the skeleton, so if the green overlay sits on your hand, the
+  //    features are in the same orientation.
+  // 2. Optionally mirror X.
+  // 3. Subtract the wrist, divide by the largest absolute value, flatten to 63
+  //    (same as the Python training pipeline).
   // ==========================================================================
 
-  List<double> _normalizeLandmarks(
-    Hand hand,
-  ) {
-    if (hand.landmarks.length !=
-        numLandmarks) {
+  List<double> _landmarksToFeatures(
+    Hand hand, {
+    required bool mirror,
+  }) {
+    if (hand.landmarks.length != numLandmarks) {
       throw Exception(
         'Expected $numLandmarks hand landmarks, '
         'but received ${hand.landmarks.length}.',
       );
     }
 
-    final values =
-        List<List<double>>.generate(
+    final controller = _controller;
+
+    if (controller == null ||
+        !controller.value.isInitialized ||
+        controller.value.previewSize == null) {
+      throw Exception('Camera is not ready.');
+    }
+
+    final Size previewSize = controller.value.previewSize!;
+    final double sensorWidth = previewSize.width;
+    final double sensorHeight = previewSize.height;
+
+    final bool isFront =
+        controller.description.lensDirection ==
+            CameraLensDirection.front;
+
+    final double angle =
+        controller.description.sensorOrientation *
+            math.pi /
+            180.0;
+
+    final double cosA = math.cos(angle);
+    final double sinA = math.sin(angle);
+
+    final values = List<List<double>>.generate(
       numLandmarks,
       (index) {
-        final landmark =
-            hand.landmarks[index];
+        final landmark = hand.landmarks[index];
 
-        double x = landmark.x;
+        // Pixels relative to the frame centre (sensor frame).
+        final double px =
+            (landmark.x - 0.5) * sensorWidth;
+        double py =
+            (landmark.y - 0.5) * sensorHeight;
 
-        final double y = landmark.y;
-
-        final double z = landmark.z;
-
-        // IMPORTANT:
-        // This remains false because the Python training
-        // normalization did not mirror X.
-        if (mirrorLandmarksForModel) {
-          x = 1.0 - x;
+        // Painter: front camera = scale(-1, 1) then rotate(pi) => (px, -py).
+        if (isFront) {
+          py = -py;
         }
 
-        return [x, y, z];
+        // Painter: rotate by sensorOrientation.
+        double sx = px * cosA - py * sinA;
+        final double sy = px * sinA + py * cosA;
+
+        // z is in roughly the same units as x (fraction of frame width).
+        final double z = landmark.z * sensorWidth;
+
+        if (mirror) {
+          sx = -sx;
+        }
+
+        return [sx, sy, z];
       },
     );
-
-    // ------------------------------------------------------------------------
-    // WRIST
-    // ------------------------------------------------------------------------
 
     final wristX = values[0][0];
     final wristY = values[0][1];
     final wristZ = values[0][2];
 
-    // ------------------------------------------------------------------------
-    // MOVE WRIST TO ORIGIN
-    // ------------------------------------------------------------------------
-
-    for (int i = 0;
-        i < numLandmarks;
-        i++) {
+    for (int i = 0; i < numLandmarks; i++) {
       values[i][0] -= wristX;
       values[i][1] -= wristY;
       values[i][2] -= wristZ;
     }
 
-    // ------------------------------------------------------------------------
-    // FIND MAXIMUM ABSOLUTE VALUE
-    // ------------------------------------------------------------------------
-
     double scale = 0.0;
 
-    for (int i = 0;
-        i < numLandmarks;
-        i++) {
-      scale = math.max(
-        scale,
-        values[i][0].abs(),
-      );
-
-      scale = math.max(
-        scale,
-        values[i][1].abs(),
-      );
-
-      scale = math.max(
-        scale,
-        values[i][2].abs(),
-      );
+    for (int i = 0; i < numLandmarks; i++) {
+      scale = math.max(scale, values[i][0].abs());
+      scale = math.max(scale, values[i][1].abs());
+      scale = math.max(scale, values[i][2].abs());
     }
 
-    // ------------------------------------------------------------------------
-    // SCALE NORMALIZATION
-    // ------------------------------------------------------------------------
-
     if (scale > 1e-6) {
-      for (int i = 0;
-          i < numLandmarks;
-          i++) {
+      for (int i = 0; i < numLandmarks; i++) {
         values[i][0] /= scale;
         values[i][1] /= scale;
         values[i][2] /= scale;
       }
     }
 
-    // ------------------------------------------------------------------------
-    // FLATTEN 21 × 3 INTO 63
-    // ------------------------------------------------------------------------
-
     final flattened = <double>[];
 
-    for (int i = 0;
-        i < numLandmarks;
-        i++) {
+    for (int i = 0; i < numLandmarks; i++) {
       flattened.add(values[i][0]);
       flattened.add(values[i][1]);
       flattened.add(values[i][2]);
     }
 
-    if (flattened.length !=
-        totalFeatures) {
+    if (flattened.length != totalFeatures) {
       throw Exception(
         'Invalid landmark feature count: '
         '${flattened.length}. '
@@ -698,6 +710,25 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     return flattened;
+  }
+
+  // ==========================================================================
+  // RUN THE TFLITE MODEL ON ONE FEATURE VECTOR
+  // ==========================================================================
+
+  List<double> _runModel(
+    Interpreter interpreter,
+    List<double> features,
+  ) {
+    final input = <List<double>>[features];
+
+    final output = <List<double>>[
+      List<double>.filled(_labels.length, 0.0),
+    ];
+
+    interpreter.run(input, output);
+
+    return List<double>.from(output[0]);
   }
 
   // ==========================================================================
@@ -742,11 +773,31 @@ class _CameraScreenState extends State<CameraScreen> {
       return;
     }
 
-    final hand =
-        handsForRecognition.first;
+    // Use the last few frames (newest last); fall back to the current hand.
+    final cutoff =
+        DateTime.now().subtract(_historyWindow);
 
-    if (hand.landmarks.length !=
-        numLandmarks) {
+    final recent = _handHistory
+        .where((entry) => entry.time.isAfter(cutoff))
+        .map((entry) => entry.hand)
+        .toList();
+
+    final frames = <Hand>[
+      if (recent.length > _historyFrames)
+        ...recent.sublist(recent.length - _historyFrames)
+      else
+        ...recent,
+    ];
+
+    if (frames.isEmpty) {
+      frames.add(handsForRecognition.first);
+    }
+
+    frames.removeWhere(
+      (h) => h.landmarks.length != numLandmarks,
+    );
+
+    if (frames.isEmpty) {
       _showMessage(
         'Could not read all 21 hand landmarks. Try again.',
       );
@@ -770,105 +821,78 @@ class _CameraScreenState extends State<CameraScreen> {
 
     try {
       // ======================================================================
-      // STEP 1: NORMALIZE LANDMARKS
+      // STEP 1-3: FEATURES + MODEL, FOR EACH ORIENTATION, AVERAGED OVER FRAMES
       // ======================================================================
-
-      final normalizedLandmarks =
-          _normalizeLandmarks(hand);
 
       debugPrint('');
-      debugPrint(
-        '========================================',
-      );
-      debugPrint(
-        'STARTING LANDMARK RECOGNITION',
-      );
-      debugPrint(
-        '========================================',
-      );
+      debugPrint('========================================');
+      debugPrint('STARTING LANDMARK RECOGNITION');
+      debugPrint('========================================');
+      debugPrint('Frames used: ${frames.length}');
 
-      debugPrint(
-        'Landmarks received: '
-        '${hand.landmarks.length}',
-      );
+      final orientations = tryBothOrientations
+          ? <bool>[false, true]
+          : <bool>[false];
 
-      debugPrint(
-        'Feature count: '
-        '${normalizedLandmarks.length}',
-      );
+      List<double>? scores;
+      bool usedMirror = false;
+      double bestOverall = -1.0;
 
-      debugPrint(
-        'Features: ${normalizedLandmarks.map(
-          (e) => e.toStringAsFixed(4),
-        ).toList()}',
-      );
+      for (final mirror in orientations) {
+        final averaged =
+            List<double>.filled(_labels.length, 0.0);
 
-      // ======================================================================
-      // STEP 2: CREATE [1,63] INPUT
-      // ======================================================================
+        for (final frame in frames) {
+          final features = _landmarksToFeatures(
+            frame,
+            mirror: mirror,
+          );
 
-      final input = <List<double>>[
-        normalizedLandmarks,
-      ];
+          if (identical(frame, frames.last)) {
+            debugPrint(
+              'FEATURES mirror=$mirror: '
+              '${features.map((e) => e.toStringAsFixed(3)).toList()}',
+            );
+          }
 
-      debugPrint(
-        'TFLite input shape: '
-        '[1, ${normalizedLandmarks.length}]',
-      );
+          final frameScores =
+              _runModel(interpreter, features);
 
-      // ======================================================================
-      // STEP 3: CREATE [1,5] OUTPUT
-      // ======================================================================
+          for (int i = 0; i < averaged.length; i++) {
+            averaged[i] += frameScores[i] / frames.length;
+          }
+        }
 
-      final output =
-          <List<double>>[
-        List<double>.filled(
-          _labels.length,
-          0.0,
-        ),
-      ];
+        double peak = averaged[0];
 
-      debugPrint(
-        'TFLite output buffer: '
-        '[1, ${_labels.length}]',
-      );
+        for (int i = 1; i < averaged.length; i++) {
+          if (averaged[i] > peak) {
+            peak = averaged[i];
+          }
+        }
 
-      // ======================================================================
-      // STEP 4: RUN MODEL
-      // ======================================================================
+        debugPrint(
+          'ORIENTATION mirror=$mirror '
+          'scores=${averaged.map((e) => e.toStringAsFixed(3)).toList()} '
+          'peak=${peak.toStringAsFixed(3)}',
+        );
 
-      debugPrint(
-        'Running TFLite landmark model...',
-      );
+        if (peak > bestOverall) {
+          bestOverall = peak;
+          scores = averaged;
+          usedMirror = mirror;
+        }
+      }
 
-      interpreter.run(
-        input,
-        output,
-      );
+      if (scores == null) {
+        throw Exception('The model returned no scores.');
+      }
 
-      debugPrint(
-        'TFLite model finished.',
-      );
-
-      // ======================================================================
-      // STEP 5: READ OUTPUT
-      // ======================================================================
-
-      final scores = output[0];
-
-      debugPrint(
-        'RAW OUTPUT: $scores',
-      );
-
+      debugPrint('Chosen orientation: mirror=$usedMirror');
       debugPrint('');
-      debugPrint(
-        'PREDICTION SCORES:',
-      );
+      debugPrint('PREDICTION SCORES:');
 
-      for (int i = 0;
-          i < scores.length &&
-              i < _labels.length;
-          i++) {
+      for (int i = 0; i < scores.length && i < _labels.length; i++) {
         debugPrint(
           '  ${_labels[i]} = '
           '${scores[i].toStringAsFixed(6)} '
@@ -884,9 +908,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
       double bestScore = scores[0];
 
-      for (int i = 1;
-          i < scores.length;
-          i++) {
+      for (int i = 1; i < scores.length; i++) {
         if (scores[i] > bestScore) {
           bestScore = scores[i];
 
@@ -895,27 +917,12 @@ class _CameraScreenState extends State<CameraScreen> {
       }
 
       debugPrint('');
-      debugPrint(
-        'BEST INDEX: $bestIndex',
-      );
-
-      debugPrint(
-        'BEST LABEL: '
-        '${_labels[bestIndex]}',
-      );
-
-      debugPrint(
-        'BEST SCORE: $bestScore',
-      );
-
+      debugPrint('BEST LABEL: ${_labels[bestIndex]}');
       debugPrint(
         'BEST CONFIDENCE: '
         '${(bestScore * 100).toStringAsFixed(2)}%',
       );
-
-      debugPrint(
-        '========================================',
-      );
+      debugPrint('========================================');
       debugPrint('');
 
       if (!mounted) {
@@ -945,6 +952,8 @@ class _CameraScreenState extends State<CameraScreen> {
           _confidence = bestScore;
 
           _statusMessage =
+              'Closest match: ${_friendlyLabel(_labels[bestIndex])} '
+              '(${(bestScore * 100).toStringAsFixed(0)}%). '
               'Try placing your hand inside the guide.';
         });
       }
@@ -997,8 +1006,8 @@ class _CameraScreenState extends State<CameraScreen> {
       case 'fist':
         return '✊ Fist';
 
-      case 'ok_sign':
-        return '👌 OK Sign';
+      case 'pointing':
+        return '👈 Pointing';
 
       case 'open_palm':
         return '✋ Open Palm';
@@ -2227,4 +2236,16 @@ class HandLandmarkPainter
   ) {
     return true;
   }
+}
+
+// ============================================================================
+// TIMESTAMPED HAND (for averaging recent frames on capture)
+// ============================================================================
+
+class _TimedHand {
+  _TimedHand(this.hand, this.time);
+
+  final Hand hand;
+
+  final DateTime time;
 }
