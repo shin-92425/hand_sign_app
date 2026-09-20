@@ -6,7 +6,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_litert/flutter_litert.dart';
 import 'package:hand_landmarker/hand_landmarker.dart';
-import 'package:image/image.dart' as img;
 
 List<CameraDescription> cameras = [];
 
@@ -15,12 +14,17 @@ Future<void> main() async {
 
   try {
     cameras = await availableCameras();
-  } catch (_) {
+  } catch (e) {
+    debugPrint('Could not get cameras: $e');
     cameras = [];
   }
 
   runApp(const HandSignApp());
 }
+
+// ============================================================================
+// APP
+// ============================================================================
 
 class HandSignApp extends StatelessWidget {
   const HandSignApp({super.key});
@@ -40,6 +44,10 @@ class HandSignApp extends StatelessWidget {
   }
 }
 
+// ============================================================================
+// CAMERA SCREEN
+// ============================================================================
+
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
 
@@ -48,31 +56,52 @@ class CameraScreen extends StatefulWidget {
 }
 
 class _CameraScreenState extends State<CameraScreen> {
-  // ============================================================
-  // MODEL SETTINGS
-  // ============================================================
+  // ==========================================================================
+  // LANDMARK MODEL SETTINGS
+  // ==========================================================================
 
-  static const int inputSize = 224;
-  static const int numClasses = 5;
+  static const int numLandmarks = 21;
+  static const int valuesPerLandmark = 3;
+  static const int totalFeatures =
+      numLandmarks * valuesPerLandmark;
+
+  // Only show a result when confidence reaches 70%.
   static const double confidenceThreshold = 0.70;
 
-  // ============================================================
-  // CAMERA / CLASSIFIER
-  // ============================================================
+  // IMPORTANT:
+  // The Python training pipeline used:
+  //
+  // 1. Original x/y/z landmarks
+  // 2. Subtract wrist
+  // 3. Find maximum absolute coordinate
+  // 4. Divide by that scale
+  // 5. Flatten to 63 values
+  //
+  // It did NOT mirror X during normalization.
+  static const bool mirrorLandmarksForModel = false;
+
+  // ==========================================================================
+  // CAMERA
+  // ==========================================================================
 
   CameraController? _controller;
-
-  Interpreter? _interpreter;
-  IsolateInterpreter? _isolateInterpreter;
-
-  List<String> _labels = [];
 
   CameraLensDirection _currentLensDirection =
       CameraLensDirection.front;
 
-  // ============================================================
-  // HAND LANDMARKER
-  // ============================================================
+  // ==========================================================================
+  // TFLITE / LITERT
+  // ==========================================================================
+
+  Interpreter? _interpreter;
+
+  List<String> _labels = [];
+
+  bool _modelReady = false;
+
+  // ==========================================================================
+  // MEDIAPIPE HAND LANDMARKER
+  // ==========================================================================
 
   HandLandmarkerPlugin? _handLandmarker;
 
@@ -82,31 +111,33 @@ class _CameraScreenState extends State<CameraScreen> {
 
   bool _handDetected = false;
 
-  // Prevent processing every single camera frame.
   bool _processingLandmarkFrame = false;
 
-  DateTime _lastLandmarkTime = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastLandmarkTime =
+      DateTime.fromMillisecondsSinceEpoch(0);
 
   static const Duration _landmarkInterval =
       Duration(milliseconds: 80);
 
-  // ============================================================
+  // ==========================================================================
   // APP STATE
-  // ============================================================
+  // ==========================================================================
 
-  bool _modelReady = false;
   bool _cameraReady = false;
+
   bool _isRecognizing = false;
+
   bool _isSwitchingCamera = false;
 
   String _statusMessage = 'Preparing camera...';
 
   String _prediction = '';
+
   double _confidence = 0.0;
 
-  // ============================================================
+  // ==========================================================================
   // INITIALIZATION
-  // ============================================================
+  // ==========================================================================
 
   @override
   void initState() {
@@ -124,12 +155,17 @@ class _CameraScreenState extends State<CameraScreen> {
     ]);
   }
 
-  // ============================================================
-  // INITIALIZE MEDIA PIPE HAND LANDMARKER
-  // ============================================================
+  // ==========================================================================
+  // MEDIAPIPE INITIALIZATION
+  // ==========================================================================
 
   Future<void> _initializeHandLandmarker() async {
     try {
+      debugPrint('');
+      debugPrint('========================================');
+      debugPrint('INITIALIZING MEDIAPIPE');
+      debugPrint('========================================');
+
       final landmarker = HandLandmarkerPlugin.create(
         numHands: 1,
         minHandDetectionConfidence: 0.5,
@@ -141,7 +177,9 @@ class _CameraScreenState extends State<CameraScreen> {
       _landmarkSubscription =
           landmarker.landmarkStream.listen(
         (hands) {
-          if (!mounted) return;
+          if (!mounted) {
+            return;
+          }
 
           setState(() {
             _detectedHands = hands;
@@ -149,16 +187,36 @@ class _CameraScreenState extends State<CameraScreen> {
           });
         },
         onError: (error) {
-          if (!mounted) return;
+          debugPrint(
+            'Hand landmark stream error: $error',
+          );
+
+          if (!mounted) {
+            return;
+          }
 
           setState(() {
-            _handDetected = false;
             _detectedHands = [];
+            _handDetected = false;
           });
         },
       );
-    } catch (e) {
-      if (!mounted) return;
+
+      debugPrint('MediaPipe initialized successfully.');
+      debugPrint('========================================');
+      debugPrint('');
+    } catch (e, stackTrace) {
+      debugPrint('');
+      debugPrint('========================================');
+      debugPrint('MEDIAPIPE INITIALIZATION ERROR');
+      debugPrint('========================================');
+      debugPrint('$e');
+      debugPrint('$stackTrace');
+      debugPrint('========================================');
+
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         _statusMessage =
@@ -167,33 +225,127 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ============================================================
-  // LOAD TENSORFLOW LITE CLASSIFIER
-  // ============================================================
+  // ==========================================================================
+  // LOAD LANDMARK TFLITE MODEL
+  // ==========================================================================
 
   Future<void> _loadModel() async {
     try {
+      debugPrint('');
+      debugPrint('========================================');
+      debugPrint('LOADING LANDMARK TFLITE MODEL');
+      debugPrint('========================================');
+
       final interpreter = await Interpreter.fromAsset(
         'assets/model.tflite',
       );
 
+      interpreter.allocateTensors();
+
       _interpreter = interpreter;
 
-      _isolateInterpreter = await IsolateInterpreter.create(
-        address: interpreter.address,
+      // ----------------------------------------------------------------------
+      // INPUT TENSOR
+      // ----------------------------------------------------------------------
+
+      final inputTensor =
+          interpreter.getInputTensor(0);
+
+      debugPrint('MODEL INPUT');
+      debugPrint(
+        '  Name : ${inputTensor.name}',
+      );
+      debugPrint(
+        '  Shape: ${inputTensor.shape}',
+      );
+      debugPrint(
+        '  Type : ${inputTensor.type}',
+      );
+      debugPrint(
+        '  Bytes: ${inputTensor.numBytes()}',
       );
 
-      final labelsData = await rootBundle.loadString(
+      // ----------------------------------------------------------------------
+      // OUTPUT TENSOR
+      // ----------------------------------------------------------------------
+
+      final outputTensor =
+          interpreter.getOutputTensor(0);
+
+      debugPrint('MODEL OUTPUT');
+      debugPrint(
+        '  Name : ${outputTensor.name}',
+      );
+      debugPrint(
+        '  Shape: ${outputTensor.shape}',
+      );
+      debugPrint(
+        '  Type : ${outputTensor.type}',
+      );
+      debugPrint(
+        '  Bytes: ${outputTensor.numBytes()}',
+      );
+
+      debugPrint(
+        'LiteRT version: ${Interpreter.version}',
+      );
+
+      // ----------------------------------------------------------------------
+      // LOAD LABELS
+      // ----------------------------------------------------------------------
+
+      final labelsData =
+          await rootBundle.loadString(
         'assets/labels.txt',
       );
 
       _labels = labelsData
-          .split('\n')
+          .split(RegExp(r'\r?\n'))
           .map((label) => label.trim())
           .where((label) => label.isNotEmpty)
           .toList();
 
-      if (!mounted) return;
+      debugPrint(
+        'LABELS: $_labels',
+      );
+
+      if (_labels.isEmpty) {
+        throw Exception(
+          'labels.txt is empty.',
+        );
+      }
+
+      // ----------------------------------------------------------------------
+      // VERIFY INPUT SHAPE
+      // ----------------------------------------------------------------------
+
+      if (inputTensor.shape.length != 2 ||
+          inputTensor.shape[0] != 1 ||
+          inputTensor.shape[1] != totalFeatures) {
+        throw Exception(
+          'Unexpected model input shape: '
+          '${inputTensor.shape}\n'
+          'Expected: [1, $totalFeatures]',
+        );
+      }
+
+      // ----------------------------------------------------------------------
+      // VERIFY OUTPUT SHAPE
+      // ----------------------------------------------------------------------
+
+      if (outputTensor.shape.length != 2 ||
+          outputTensor.shape[0] != 1 ||
+          outputTensor.shape[1] != _labels.length) {
+        throw Exception(
+          'Unexpected model output shape: '
+          '${outputTensor.shape}\n'
+          'Expected: [1, ${_labels.length}]',
+        );
+      }
+
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         _modelReady = true;
@@ -202,23 +354,53 @@ class _CameraScreenState extends State<CameraScreen> {
           _statusMessage = 'Ready';
         }
       });
-    } catch (e) {
-      if (!mounted) return;
+
+      debugPrint('');
+      debugPrint('========================================');
+      debugPrint('MODEL READY');
+      debugPrint('========================================');
+      debugPrint(
+        'Input : ${inputTensor.shape}',
+      );
+      debugPrint(
+        'Output: ${outputTensor.shape}',
+      );
+      debugPrint(
+        'Labels: $_labels',
+      );
+      debugPrint('========================================');
+      debugPrint('');
+    } catch (e, stackTrace) {
+      debugPrint('');
+      debugPrint('========================================');
+      debugPrint('MODEL LOAD ERROR');
+      debugPrint('========================================');
+      debugPrint('$e');
+      debugPrint('$stackTrace');
+      debugPrint('========================================');
+
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
+        _modelReady = false;
+
         _statusMessage =
             'Unable to load the recognition model.\n\n$e';
       });
     }
   }
 
-  // ============================================================
-  // INITIALIZE CAMERA
-  // ============================================================
+  // ==========================================================================
+  // CAMERA INITIALIZATION
+  // ==========================================================================
 
   Future<void> _initCamera() async {
     if (cameras.isEmpty) {
-      if (!mounted) return;
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         _statusMessage =
@@ -238,9 +420,9 @@ class _CameraScreenState extends State<CameraScreen> {
     await _startCamera(camera);
   }
 
-  // ============================================================
+  // ==========================================================================
   // START CAMERA
-  // ============================================================
+  // ==========================================================================
 
   Future<void> _startCamera(
     CameraDescription camera,
@@ -262,10 +444,14 @@ class _CameraScreenState extends State<CameraScreen> {
 
       setState(() {
         _controller = controller;
+
         _cameraReady = true;
+
         _currentLensDirection =
             camera.lensDirection;
+
         _detectedHands = [];
+
         _handDetected = false;
 
         if (_modelReady) {
@@ -276,29 +462,37 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       });
 
-      // Start live camera frames for MediaPipe.
       await _startLandmarkStream(controller);
     } catch (e) {
       await controller.dispose();
 
-      if (!mounted) return;
+      debugPrint(
+        'Camera initialization error: $e',
+      );
+
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         _cameraReady = false;
+
         _statusMessage =
             'Could not start the camera.\n\n$e';
       });
     }
   }
 
-  // ============================================================
-  // START LANDMARK STREAM
-  // ============================================================
+  // ==========================================================================
+  // START CAMERA IMAGE STREAM
+  // ==========================================================================
 
   Future<void> _startLandmarkStream(
     CameraController controller,
   ) async {
-    if (!controller.value.isInitialized) return;
+    if (!controller.value.isInitialized) {
+      return;
+    }
 
     if (controller.value.isStreamingImages) {
       return;
@@ -313,6 +507,10 @@ class _CameraScreenState extends State<CameraScreen> {
           );
         },
       );
+
+      debugPrint(
+        'Camera image stream started.',
+      );
     } catch (e) {
       debugPrint(
         'Could not start landmark camera stream: $e',
@@ -320,9 +518,9 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ============================================================
-  // PROCESS LIVE FRAME
-  // ============================================================
+  // ==========================================================================
+  // PROCESS LIVE CAMERA FRAME
+  // ==========================================================================
 
   void _processLandmarkFrame(
     CameraImage image,
@@ -330,9 +528,12 @@ class _CameraScreenState extends State<CameraScreen> {
   ) {
     final landmarker = _handLandmarker;
 
-    if (landmarker == null) return;
+    if (landmarker == null) {
+      return;
+    }
 
-    if (_isRecognizing || _isSwitchingCamera) {
+    if (_isRecognizing ||
+        _isSwitchingCamera) {
       return;
     }
 
@@ -348,6 +549,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     _lastLandmarkTime = now;
+
     _processingLandmarkFrame = true;
 
     try {
@@ -364,253 +566,372 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ============================================================
-  // SWITCH CAMERA
-  // ============================================================
+  // ==========================================================================
+  // NORMALIZE LANDMARKS
+  //
+  // EXACTLY MATCHES THE PYTHON TRAINING PIPELINE:
+  //
+  // 21 landmarks × 3 = 63 values
+  //
+  // 1. Read x/y/z
+  // 2. Subtract wrist coordinates
+  // 3. Find maximum absolute value
+  // 4. Divide all values by scale
+  // 5. Flatten to 63 values
+  // ==========================================================================
 
-  Future<void> _switchCamera() async {
-    if (_isSwitchingCamera || _isRecognizing) {
-      return;
+  List<double> _normalizeLandmarks(
+    Hand hand,
+  ) {
+    if (hand.landmarks.length !=
+        numLandmarks) {
+      throw Exception(
+        'Expected $numLandmarks hand landmarks, '
+        'but received ${hand.landmarks.length}.',
+      );
     }
 
-    if (cameras.length < 2) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'This device does not have another camera.',
-          ),
-        ),
-      );
+    final values =
+        List<List<double>>.generate(
+      numLandmarks,
+      (index) {
+        final landmark =
+            hand.landmarks[index];
 
-      return;
-    }
+        double x = landmark.x;
 
-    setState(() {
-      _isSwitchingCamera = true;
-      _cameraReady = false;
-      _statusMessage = 'Switching camera...';
-      _prediction = '';
-      _confidence = 0.0;
-      _detectedHands = [];
-      _handDetected = false;
-    });
+        final double y = landmark.y;
 
-    try {
-      final oldController = _controller;
+        final double z = landmark.z;
 
-      if (oldController != null) {
-        try {
-          if (oldController.value.isStreamingImages) {
-            await oldController.stopImageStream();
-          }
-        } catch (_) {}
-
-        await oldController.dispose();
-      }
-
-      _controller = null;
-
-      final newCamera = cameras.firstWhere(
-        (camera) =>
-            camera.lensDirection !=
-            _currentLensDirection,
-        orElse: () => cameras.first,
-      );
-
-      await _startCamera(newCamera);
-
-      if (!mounted) return;
-
-      setState(() {
-        _isSwitchingCamera = false;
-
-        if (_modelReady) {
-          _statusMessage = 'Ready';
+        // IMPORTANT:
+        // This remains false because the Python training
+        // normalization did not mirror X.
+        if (mirrorLandmarksForModel) {
+          x = 1.0 - x;
         }
-      });
-    } catch (e) {
-      if (!mounted) return;
 
-      setState(() {
-        _isSwitchingCamera = false;
-        _cameraReady = false;
-        _statusMessage =
-            'Could not switch camera.\n\n$e';
-      });
+        return [x, y, z];
+      },
+    );
+
+    // ------------------------------------------------------------------------
+    // WRIST
+    // ------------------------------------------------------------------------
+
+    final wristX = values[0][0];
+    final wristY = values[0][1];
+    final wristZ = values[0][2];
+
+    // ------------------------------------------------------------------------
+    // MOVE WRIST TO ORIGIN
+    // ------------------------------------------------------------------------
+
+    for (int i = 0;
+        i < numLandmarks;
+        i++) {
+      values[i][0] -= wristX;
+      values[i][1] -= wristY;
+      values[i][2] -= wristZ;
     }
+
+    // ------------------------------------------------------------------------
+    // FIND MAXIMUM ABSOLUTE VALUE
+    // ------------------------------------------------------------------------
+
+    double scale = 0.0;
+
+    for (int i = 0;
+        i < numLandmarks;
+        i++) {
+      scale = math.max(
+        scale,
+        values[i][0].abs(),
+      );
+
+      scale = math.max(
+        scale,
+        values[i][1].abs(),
+      );
+
+      scale = math.max(
+        scale,
+        values[i][2].abs(),
+      );
+    }
+
+    // ------------------------------------------------------------------------
+    // SCALE NORMALIZATION
+    // ------------------------------------------------------------------------
+
+    if (scale > 1e-6) {
+      for (int i = 0;
+          i < numLandmarks;
+          i++) {
+        values[i][0] /= scale;
+        values[i][1] /= scale;
+        values[i][2] /= scale;
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // FLATTEN 21 × 3 INTO 63
+    // ------------------------------------------------------------------------
+
+    final flattened = <double>[];
+
+    for (int i = 0;
+        i < numLandmarks;
+        i++) {
+      flattened.add(values[i][0]);
+      flattened.add(values[i][1]);
+      flattened.add(values[i][2]);
+    }
+
+    if (flattened.length !=
+        totalFeatures) {
+      throw Exception(
+        'Invalid landmark feature count: '
+        '${flattened.length}. '
+        'Expected $totalFeatures.',
+      );
+    }
+
+    return flattened;
   }
 
-  // ============================================================
-  // SHUTTER BUTTON
-  // ============================================================
+  // ==========================================================================
+  // RECOGNIZE HAND SIGN
+  // ==========================================================================
 
   Future<void> _recognizeHandSign() async {
-    if (_isRecognizing) return;
+    if (_isRecognizing) {
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // CHECK MODEL
+    // ------------------------------------------------------------------------
+
+    final interpreter = _interpreter;
 
     if (!_modelReady ||
-        _isolateInterpreter == null ||
+        interpreter == null ||
         _labels.isEmpty) {
       _showMessage(
         'The recognition model is still loading.',
       );
+
       return;
     }
 
-    final controller = _controller;
+    // ------------------------------------------------------------------------
+    // COPY CURRENT HAND
+    // ------------------------------------------------------------------------
 
-    if (controller == null ||
-        !controller.value.isInitialized) {
-      _showMessage(
-        'The camera is not ready yet.',
-      );
-      return;
-    }
+    final handsForRecognition =
+        List<Hand>.from(
+      _detectedHands,
+    );
 
-    // Keep a copy of the latest MediaPipe landmarks.
-    // We need these to locate the hand inside the captured photo.
-    final handsForCrop = List<Hand>.from(_detectedHands);
-
-    if (handsForCrop.isEmpty) {
+    if (handsForRecognition.isEmpty) {
       _showMessage(
         'No hand detected. Place your hand inside the guide first.',
       );
+
       return;
     }
 
+    final hand =
+        handsForRecognition.first;
+
+    if (hand.landmarks.length !=
+        numLandmarks) {
+      _showMessage(
+        'Could not read all 21 hand landmarks. Try again.',
+      );
+
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // RECOGNITION STATE
+    // ------------------------------------------------------------------------
+
     setState(() {
       _isRecognizing = true;
-      _prediction = '';
-      _confidence = 0.0;
-      _statusMessage = 'Recognizing...';
 
-      // Do NOT clear the landmarks yet.
-      // They are needed to calculate the hand crop.
+      _prediction = '';
+
+      _confidence = 0.0;
+
+      _statusMessage = 'Recognizing...';
     });
 
     try {
-      // ----------------------------------------------------------
-      // Stop live stream before takePicture().
-      // ----------------------------------------------------------
+      // ======================================================================
+      // STEP 1: NORMALIZE LANDMARKS
+      // ======================================================================
 
-      if (controller.value.isStreamingImages) {
-        await controller.stopImageStream();
-      }
+      final normalizedLandmarks =
+          _normalizeLandmarks(hand);
 
-      // ----------------------------------------------------------
-      // Capture a single image.
-      // ----------------------------------------------------------
-
-      final XFile photo = await controller.takePicture();
-
-      // ----------------------------------------------------------
-      // Read captured image.
-      // ----------------------------------------------------------
-
-      final Uint8List bytes =
-          await photo.readAsBytes();
-
-      // ----------------------------------------------------------
-      // Decode image.
-      // ----------------------------------------------------------
-
-      final img.Image? decoded =
-          img.decodeImage(bytes);
-
-      if (decoded == null) {
-        throw Exception(
-          'Could not read the captured image.',
-        );
-      }
-
-      // ----------------------------------------------------------
-      // Fix camera orientation.
-      // ----------------------------------------------------------
-
-      final oriented =
-          img.bakeOrientation(decoded);
-
+      debugPrint('');
       debugPrint(
-        'Captured image: '
-        '${oriented.width} x ${oriented.height}',
+        '========================================',
       );
-
-      // ----------------------------------------------------------
-      // Crop around the detected hand.
-      // ----------------------------------------------------------
-
-      final croppedHand = _cropHandFromPhoto(
-        oriented,
-        handsForCrop.first,
+      debugPrint(
+        'STARTING LANDMARK RECOGNITION',
+      );
+      debugPrint(
+        '========================================',
       );
 
       debugPrint(
-        'Hand crop: '
-        '${croppedHand.width} x ${croppedHand.height}',
+        'Landmarks received: '
+        '${hand.landmarks.length}',
       );
 
-      // ----------------------------------------------------------
-      // Prepare cropped hand for TFLite.
-      //
-      // IMPORTANT:
-      // The TFLite model already contains MobileNetV2
-      // preprocessing, so we send normal 0-255 RGB values.
-      // ----------------------------------------------------------
+      debugPrint(
+        'Feature count: '
+        '${normalizedLandmarks.length}',
+      );
 
-      final input =
-          _preprocessPhoto(croppedHand);
+      debugPrint(
+        'Features: ${normalizedLandmarks.map(
+          (e) => e.toStringAsFixed(4),
+        ).toList()}',
+      );
 
-      // ----------------------------------------------------------
-      // Model output.
-      // ----------------------------------------------------------
+      // ======================================================================
+      // STEP 2: CREATE [1,63] INPUT
+      // ======================================================================
 
-      final output = [
+      final input = <List<double>>[
+        normalizedLandmarks,
+      ];
+
+      debugPrint(
+        'TFLite input shape: '
+        '[1, ${normalizedLandmarks.length}]',
+      );
+
+      // ======================================================================
+      // STEP 3: CREATE [1,5] OUTPUT
+      // ======================================================================
+
+      final output =
+          <List<double>>[
         List<double>.filled(
-          numClasses,
+          _labels.length,
           0.0,
         ),
       ];
 
-      // ----------------------------------------------------------
-      // Run TensorFlow Lite.
-      // ----------------------------------------------------------
+      debugPrint(
+        'TFLite output buffer: '
+        '[1, ${_labels.length}]',
+      );
 
-      await _isolateInterpreter!.run(
+      // ======================================================================
+      // STEP 4: RUN MODEL
+      // ======================================================================
+
+      debugPrint(
+        'Running TFLite landmark model...',
+      );
+
+      interpreter.run(
         input,
         output,
       );
 
+      debugPrint(
+        'TFLite model finished.',
+      );
+
+      // ======================================================================
+      // STEP 5: READ OUTPUT
+      // ======================================================================
+
       final scores = output[0];
 
       debugPrint(
-        'Prediction scores: '
-        '${scores.map((e) => e.toStringAsFixed(4)).toList()}',
+        'RAW OUTPUT: $scores',
       );
 
-      // ----------------------------------------------------------
-      // Find highest score.
-      // ----------------------------------------------------------
+      debugPrint('');
+      debugPrint(
+        'PREDICTION SCORES:',
+      );
+
+      for (int i = 0;
+          i < scores.length &&
+              i < _labels.length;
+          i++) {
+        debugPrint(
+          '  ${_labels[i]} = '
+          '${scores[i].toStringAsFixed(6)} '
+          '(${(scores[i] * 100).toStringAsFixed(2)}%)',
+        );
+      }
+
+      // ======================================================================
+      // STEP 6: FIND HIGHEST SCORE
+      // ======================================================================
 
       int bestIndex = 0;
+
       double bestScore = scores[0];
 
-      for (int i = 1; i < scores.length; i++) {
+      for (int i = 1;
+          i < scores.length;
+          i++) {
         if (scores[i] > bestScore) {
           bestScore = scores[i];
+
           bestIndex = i;
         }
       }
 
-      if (!mounted) return;
+      debugPrint('');
+      debugPrint(
+        'BEST INDEX: $bestIndex',
+      );
 
-      // ----------------------------------------------------------
-      // Result.
-      // ----------------------------------------------------------
+      debugPrint(
+        'BEST LABEL: '
+        '${_labels[bestIndex]}',
+      );
 
-      if (bestScore >= confidenceThreshold &&
-          bestIndex < _labels.length) {
+      debugPrint(
+        'BEST SCORE: $bestScore',
+      );
+
+      debugPrint(
+        'BEST CONFIDENCE: '
+        '${(bestScore * 100).toStringAsFixed(2)}%',
+      );
+
+      debugPrint(
+        '========================================',
+      );
+      debugPrint('');
+
+      if (!mounted) {
+        return;
+      }
+
+      // ======================================================================
+      // STEP 7: DISPLAY RESULT
+      // ======================================================================
+
+      if (bestScore >= confidenceThreshold) {
         setState(() {
           _prediction =
-              _friendlyLabel(_labels[bestIndex]);
+              _friendlyLabel(
+            _labels[bestIndex],
+          );
 
           _confidence = bestScore;
 
@@ -620,6 +941,7 @@ class _CameraScreenState extends State<CameraScreen> {
       } else {
         setState(() {
           _prediction = 'No clear sign';
+
           _confidence = bestScore;
 
           _statusMessage =
@@ -627,192 +949,50 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
     } catch (e, stackTrace) {
+      debugPrint('');
       debugPrint(
-        'Recognition error: $e',
+        '========================================',
+      );
+      debugPrint(
+        'RECOGNITION ERROR',
+      );
+      debugPrint(
+        '========================================',
+      );
+      debugPrint('$e');
+      debugPrint('$stackTrace');
+      debugPrint(
+        '========================================',
       );
 
-      debugPrint(
-        '$stackTrace',
-      );
-
-      if (!mounted) return;
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         _prediction = '';
+
         _confidence = 0.0;
 
         _statusMessage =
-            'Something went wrong.\n\nPlease try again.';
+            'Recognition failed.\n\n$e';
       });
     } finally {
-      // ----------------------------------------------------------
-      // Restart live landmarks.
-      // ----------------------------------------------------------
-
       if (mounted) {
         setState(() {
           _isRecognizing = false;
-          _detectedHands = [];
-          _handDetected = false;
         });
-
-        await _startLandmarkStream(controller);
       }
     }
   }
-  // ============================================================
-  // CROP DETECTED HAND FROM PHOTO
-  // ============================================================
 
-  img.Image _cropHandFromPhoto(
-    img.Image source,
-    Hand hand,
+  // ==========================================================================
+  // FRIENDLY LABEL
+  // ==========================================================================
+
+  String _friendlyLabel(
+    String label,
   ) {
-    if (hand.landmarks.isEmpty) {
-      return source;
-    }
-
-    // ----------------------------------------------------------
-    // Find the minimum and maximum normalized landmark positions.
-    //
-    // MediaPipe coordinates are normally:
-    // x = 0.0 ... 1.0
-    // y = 0.0 ... 1.0
-    // ----------------------------------------------------------
-
-    double minX = 1.0;
-    double maxX = 0.0;
-    double minY = 1.0;
-    double maxY = 0.0;
-
-    for (final landmark in hand.landmarks) {
-      minX = math.min(minX, landmark.x);
-      maxX = math.max(maxX, landmark.x);
-      minY = math.min(minY, landmark.y);
-      maxY = math.max(maxY, landmark.y);
-    }
-
-    // ----------------------------------------------------------
-    // Add padding around the hand.
-    //
-    // This prevents fingers from being cut off and gives the
-    // classifier a little surrounding context.
-    // ----------------------------------------------------------
-
-    const double padding = 0.25;
-
-    final double handWidth =
-        maxX - minX;
-
-    final double handHeight =
-        maxY - minY;
-
-    minX -= handWidth * padding;
-    maxX += handWidth * padding;
-
-    minY -= handHeight * padding;
-    maxY += handHeight * padding;
-
-    // ----------------------------------------------------------
-    // Clamp normalized coordinates.
-    // ----------------------------------------------------------
-
-    minX = minX.clamp(0.0, 1.0);
-    maxX = maxX.clamp(0.0, 1.0);
-
-    minY = minY.clamp(0.0, 1.0);
-    maxY = maxY.clamp(0.0, 1.0);
-
-    // ----------------------------------------------------------
-    // Convert normalized coordinates to pixels.
-    // ----------------------------------------------------------
-
-    int left =
-        (minX * source.width).round();
-
-    int top =
-        (minY * source.height).round();
-
-    int right =
-        (maxX * source.width).round();
-
-    int bottom =
-        (maxY * source.height).round();
-
-    // ----------------------------------------------------------
-    // Make sure coordinates are valid.
-    // ----------------------------------------------------------
-
-    left = left.clamp(0, source.width - 1);
-    top = top.clamp(0, source.height - 1);
-
-    right = right.clamp(left + 1, source.width);
-    bottom = bottom.clamp(top + 1, source.height);
-
-    final int cropWidth =
-        right - left;
-
-    final int cropHeight =
-        bottom - top;
-
-    debugPrint(
-      'Hand bounding box: '
-      'left=$left, top=$top, '
-      'width=$cropWidth, height=$cropHeight',
-    );
-
-    // ----------------------------------------------------------
-    // Crop the hand.
-    // ----------------------------------------------------------
-
-    return img.copyCrop(
-      source,
-      x: left,
-      y: top,
-      width: cropWidth,
-      height: cropHeight,
-    );
-  }
-  // ============================================================
-  // PREPROCESS CAPTURED PHOTO
-  // ============================================================
-
-  List<List<List<List<double>>>> _preprocessPhoto(
-    img.Image source,
-  ) {
-    final resized = img.copyResize(
-      source,
-      width: inputSize,
-      height: inputSize,
-    );
-
-    return [
-      List.generate(
-        inputSize,
-        (y) {
-          return List.generate(
-            inputSize,
-            (x) {
-              final pixel =
-                  resized.getPixel(x, y);
-
-              return [
-                pixel.r.toDouble(),
-                pixel.g.toDouble(),
-                pixel.b.toDouble(),
-              ];
-            },
-          );
-        },
-      ),
-    ];
-  }
-
-  // ============================================================
-  // FRIENDLY LABELS
-  // ============================================================
-
-  String _friendlyLabel(String label) {
     switch (label.toLowerCase().trim()) {
       case 'fist':
         return '✊ Fist';
@@ -834,40 +1014,158 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ============================================================
+  // ==========================================================================
   // TRY AGAIN
-  // ============================================================
+  // ==========================================================================
 
   void _tryAgain() {
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
 
     setState(() {
       _prediction = '';
-      _confidence = 0.0;
-      _statusMessage = 'Ready';
-    });
 
-    _startLandmarkStream(
-      _controller!,
-    );
+      _confidence = 0.0;
+
+      _statusMessage =
+          _modelReady && _cameraReady
+              ? 'Ready'
+              : 'Preparing...';
+    });
   }
 
-  // ============================================================
-  // MESSAGE
-  // ============================================================
+  // ==========================================================================
+  // SWITCH CAMERA
+  // ==========================================================================
 
-  void _showMessage(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
+  Future<void> _switchCamera() async {
+    if (_isSwitchingCamera ||
+        _isRecognizing) {
+      return;
+    }
+
+    if (cameras.length < 2) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This device does not have another camera.',
+          ),
+        ),
+      );
+
+      return;
+    }
+
+    setState(() {
+      _isSwitchingCamera = true;
+
+      _cameraReady = false;
+
+      _statusMessage =
+          'Switching camera...';
+
+      _prediction = '';
+
+      _confidence = 0.0;
+
+      _detectedHands = [];
+
+      _handDetected = false;
+    });
+
+    try {
+      // ----------------------------------------------------------------------
+      // STOP OLD CAMERA
+      // ----------------------------------------------------------------------
+
+      final oldController =
+          _controller;
+
+      if (oldController != null) {
+        try {
+          if (oldController
+              .value
+              .isStreamingImages) {
+            await oldController.stopImageStream();
+          }
+        } catch (_) {}
+
+        await oldController.dispose();
+      }
+
+      _controller = null;
+
+      // ----------------------------------------------------------------------
+      // FIND OTHER CAMERA
+      // ----------------------------------------------------------------------
+
+      final newCamera =
+          cameras.firstWhere(
+        (camera) =>
+            camera.lensDirection !=
+            _currentLensDirection,
+        orElse: () => cameras.first,
+      );
+
+      await _startCamera(newCamera);
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isSwitchingCamera = false;
+
+        if (_modelReady) {
+          _statusMessage = 'Ready';
+        }
+      });
+    } catch (e) {
+      debugPrint(
+        'Camera switch error: $e',
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isSwitchingCamera = false;
+
+        _cameraReady = false;
+
+        _statusMessage =
+            'Could not switch camera.\n\n$e';
+      });
+    }
+  }
+
+  // ==========================================================================
+  // SHOW MESSAGE
+  // ==========================================================================
+
+  void _showMessage(
+    String message,
+  ) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
       SnackBar(
         content: Text(message),
-        behavior: SnackBarBehavior.floating,
+        behavior:
+            SnackBarBehavior.floating,
       ),
     );
   }
 
-  // ============================================================
+  // ==========================================================================
   // DISPOSE
-  // ============================================================
+  // ==========================================================================
 
   @override
   void dispose() {
@@ -877,28 +1175,28 @@ class _CameraScreenState extends State<CameraScreen> {
 
     _controller?.dispose();
 
-    _isolateInterpreter?.close();
-
     _interpreter?.close();
 
     super.dispose();
   }
 
-  // ============================================================
+  // ==========================================================================
   // BUILD
-  // ============================================================
+  // ==========================================================================
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(
+    BuildContext context,
+  ) {
     final controller = _controller;
 
     final bool showResult =
         _prediction.isNotEmpty &&
         !_isRecognizing;
 
-    // ----------------------------------------------------------
+    // =========================================================================
     // CAMERA NOT READY
-    // ----------------------------------------------------------
+    // =========================================================================
 
     if (controller == null ||
         !controller.value.isInitialized) {
@@ -975,40 +1273,66 @@ class _CameraScreenState extends State<CameraScreen> {
       );
     }
 
-    // ----------------------------------------------------------
+    // =========================================================================
     // MAIN CAMERA SCREEN
-    // ----------------------------------------------------------
+    // =========================================================================
 
     return Scaffold(
       backgroundColor: Colors.black,
-
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // ======================================================
-          // CAMERA
-          // ======================================================
+          // ===================================================================
+          // CAMERA + HAND LANDMARKS
+          // ===================================================================
 
-          CameraPreview(controller),
+          Center(
+            child: AspectRatio(
+              aspectRatio:
+                  controller
+                          .value
+                          .previewSize!
+                          .height /
+                      controller
+                          .value
+                          .previewSize!
+                          .width,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  CameraPreview(
+                    controller,
+                  ),
 
-          // ======================================================
-          // LANDMARK OVERLAY
-          // ======================================================
-
-          IgnorePointer(
-            child: CustomPaint(
-              painter: HandLandmarkPainter(
-                hands: _detectedHands,
-                mirror:
-                    _currentLensDirection ==
-                        CameraLensDirection.front,
+                  IgnorePointer(
+                    child: CustomPaint(
+                      painter:
+                          HandLandmarkPainter(
+                        hands:
+                            _detectedHands,
+                        previewSize:
+                            controller
+                                .value
+                                .previewSize!,
+                        lensDirection:
+                            controller
+                                .description
+                                .lensDirection,
+                        sensorOrientation:
+                            controller
+                                .description
+                                .sensorOrientation,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
 
-          // ======================================================
+          // ===================================================================
           // TOP GRADIENT
-          // ======================================================
+          // ===================================================================
 
           Positioned(
             top: 0,
@@ -1033,9 +1357,9 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
           ),
 
-          // ======================================================
+          // ===================================================================
           // APP TITLE
-          // ======================================================
+          // ===================================================================
 
           SafeArea(
             child: Padding(
@@ -1052,8 +1376,9 @@ class _CameraScreenState extends State<CameraScreen> {
                     decoration:
                         BoxDecoration(
                       color:
-                          Colors.white.withOpacity(
-                        0.90,
+                          Colors.white
+                              .withValues(
+                        alpha: 0.90,
                       ),
                       shape:
                           BoxShape.circle,
@@ -1074,7 +1399,8 @@ class _CameraScreenState extends State<CameraScreen> {
                   const Expanded(
                     child: Column(
                       crossAxisAlignment:
-                          CrossAxisAlignment.start,
+                          CrossAxisAlignment
+                              .start,
                       children: [
                         Text(
                           'Hand Sign Learner',
@@ -1086,7 +1412,6 @@ class _CameraScreenState extends State<CameraScreen> {
                                 FontWeight.bold,
                           ),
                         ),
-
                         Text(
                           'Show your hand sign',
                           style: TextStyle(
@@ -1099,22 +1424,22 @@ class _CameraScreenState extends State<CameraScreen> {
                     ),
                   ),
 
-                  // Camera switch
                   Material(
                     color: Colors.black
-                        .withOpacity(0.45),
+                        .withValues(
+                      alpha: 0.45,
+                    ),
                     shape:
                         const CircleBorder(),
-                    child: IconButton(
+                    child:
+                        IconButton(
                       tooltip:
                           'Switch Camera',
-
                       onPressed:
                           (_isSwitchingCamera ||
                                   _isRecognizing)
                               ? null
                               : _switchCamera,
-
                       icon:
                           const Icon(
                         Icons
@@ -1129,9 +1454,9 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
           ),
 
-          // ======================================================
-          // HAND GUIDE + DETECTION STATUS
-          // ======================================================
+          // ===================================================================
+          // HAND GUIDE
+          // ===================================================================
 
           Center(
             child: Column(
@@ -1151,8 +1476,8 @@ class _CameraScreenState extends State<CameraScreen> {
                       color: _handDetected
                           ? Colors.greenAccent
                           : Colors.white
-                              .withOpacity(
-                              0.85,
+                              .withValues(
+                              alpha: 0.85,
                             ),
                       width: 3,
                     ),
@@ -1166,8 +1491,8 @@ class _CameraScreenState extends State<CameraScreen> {
                                 BoxShadow(
                                   color: Colors
                                       .greenAccent
-                                      .withOpacity(
-                                    0.45,
+                                      .withValues(
+                                    alpha: 0.45,
                                   ),
                                   blurRadius: 18,
                                   spreadRadius: 2,
@@ -1179,8 +1504,7 @@ class _CameraScreenState extends State<CameraScreen> {
                     child: _isRecognizing
                         ? const Column(
                             mainAxisSize:
-                                MainAxisSize
-                                    .min,
+                                MainAxisSize.min,
                             children: [
                               CircularProgressIndicator(
                                 color:
@@ -1188,11 +1512,9 @@ class _CameraScreenState extends State<CameraScreen> {
                                 strokeWidth:
                                     4,
                               ),
-
                               SizedBox(
                                 height: 18,
                               ),
-
                               Text(
                                 'Recognizing...',
                                 style:
@@ -1231,7 +1553,8 @@ class _CameraScreenState extends State<CameraScreen> {
                               fontSize: 17,
                               fontWeight:
                                   FontWeight.bold,
-                              shadows: const [
+                              shadows:
+                                  const [
                                 Shadow(
                                   blurRadius:
                                       6,
@@ -1259,8 +1582,8 @@ class _CameraScreenState extends State<CameraScreen> {
                     decoration:
                         BoxDecoration(
                       color: Colors.black
-                          .withOpacity(
-                        0.50,
+                          .withValues(
+                        alpha: 0.50,
                       ),
                       borderRadius:
                           BorderRadius.circular(
@@ -1283,9 +1606,9 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
           ),
 
-          // ======================================================
-          // HAND DETECTION STATUS PILL
-          // ======================================================
+          // ===================================================================
+          // HAND DETECTION STATUS
+          // ===================================================================
 
           Positioned(
             top: 105,
@@ -1307,8 +1630,8 @@ class _CameraScreenState extends State<CameraScreen> {
                   color: _handDetected
                       ? Colors.green
                       : Colors.black
-                          .withOpacity(
-                          0.55,
+                          .withValues(
+                          alpha: 0.55,
                         ),
                   borderRadius:
                       BorderRadius.circular(
@@ -1353,9 +1676,9 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
           ),
 
-          // ======================================================
+          // ===================================================================
           // BOTTOM AREA
-          // ======================================================
+          // ===================================================================
 
           Positioned(
             left: 0,
@@ -1380,17 +1703,17 @@ class _CameraScreenState extends State<CameraScreen> {
                   colors: [
                     Colors.transparent,
                     Colors.black
-                        .withOpacity(
-                      0.88,
+                        .withValues(
+                      alpha: 0.88,
                     ),
                   ],
                 ),
               ),
               child: Column(
                 children: [
-                  // =================================================
-                  // RESULT
-                  // =================================================
+                  // ===========================================================
+                  // RESULT CARD
+                  // ===========================================================
 
                   if (showResult)
                     Container(
@@ -1500,14 +1823,12 @@ class _CameraScreenState extends State<CameraScreen> {
                             ),
                           ),
 
-                          if (_confidence >
-                              0)
+                          if (_confidence > 0)
                             const SizedBox(
                               height: 5,
                             ),
 
-                          if (_confidence >
-                              0)
+                          if (_confidence > 0)
                             Text(
                               'Confidence: '
                               '${(_confidence * 100).toStringAsFixed(1)}%',
@@ -1565,9 +1886,9 @@ class _CameraScreenState extends State<CameraScreen> {
                       ),
                     ),
 
-                  // =================================================
+                  // ===========================================================
                   // SHUTTER BUTTON
-                  // =================================================
+                  // ===========================================================
 
                   if (!showResult)
                     Row(
@@ -1580,7 +1901,6 @@ class _CameraScreenState extends State<CameraScreen> {
                               _isRecognizing
                                   ? null
                                   : _recognizeHandSign,
-
                           child:
                               AnimatedContainer(
                             duration:
@@ -1699,53 +2019,56 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
-// ==================================================================
+// ============================================================================
 // HAND LANDMARK PAINTER
-// ==================================================================
+// ============================================================================
 
 class HandLandmarkPainter
     extends CustomPainter {
-  final List<Hand> hands;
-  final bool mirror;
-
   HandLandmarkPainter({
     required this.hands,
-    required this.mirror,
+    required this.previewSize,
+    required this.lensDirection,
+    required this.sensorOrientation,
   });
 
-  // MediaPipe hand landmark connections.
-  static const List<List<int>> connections = [
-    // Thumb
+  final List<Hand> hands;
+
+  final Size previewSize;
+
+  final CameraLensDirection
+      lensDirection;
+
+  final int sensorOrientation;
+
+  // MediaPipe hand connections.
+  static const List<List<int>>
+      connections = [
     [0, 1],
     [1, 2],
     [2, 3],
     [3, 4],
 
-    // Index finger
     [0, 5],
     [5, 6],
     [6, 7],
     [7, 8],
 
-    // Middle finger
     [0, 9],
     [9, 10],
     [10, 11],
     [11, 12],
 
-    // Ring finger
     [0, 13],
     [13, 14],
     [14, 15],
     [15, 16],
 
-    // Pinky
     [0, 17],
     [17, 18],
     [18, 19],
     [19, 20],
 
-    // Palm
     [5, 9],
     [9, 13],
     [13, 17],
@@ -1756,81 +2079,152 @@ class HandLandmarkPainter
     Canvas canvas,
     Size size,
   ) {
-    if (hands.isEmpty) return;
+    if (hands.isEmpty ||
+        size.width <= 0 ||
+        size.height <= 0) {
+      return;
+    }
 
-    final bonePaint = Paint()
-      ..color = Colors.greenAccent
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke;
+    final scale =
+        size.width /
+            previewSize.height;
 
     final pointPaint = Paint()
-      ..color = Colors.white
-      ..style = PaintingStyle.fill;
-
-    final pointBorderPaint = Paint()
       ..color = Colors.greenAccent
-      ..strokeWidth = 2
-      ..style = PaintingStyle.stroke;
+      ..style =
+          PaintingStyle.fill;
+
+    final pointBorderPaint =
+        Paint()
+          ..color = Colors.white
+          ..strokeWidth =
+              2 / scale
+          ..style =
+              PaintingStyle.stroke;
+
+    final linePaint = Paint()
+      ..color = Colors.greenAccent
+      ..strokeWidth =
+          4 / scale
+      ..strokeCap =
+          StrokeCap.round
+      ..style =
+          PaintingStyle.stroke;
+
+    canvas.save();
+
+    final center = Offset(
+      size.width / 2,
+      size.height / 2,
+    );
+
+    canvas.translate(
+      center.dx,
+      center.dy,
+    );
+
+    canvas.rotate(
+      sensorOrientation *
+          math.pi /
+          180,
+    );
+
+    if (lensDirection ==
+        CameraLensDirection.front) {
+      canvas.scale(-1, 1);
+
+      canvas.rotate(math.pi);
+    }
+
+    canvas.scale(scale);
+
+    final logicalWidth =
+        previewSize.width;
+
+    final logicalHeight =
+        previewSize.height;
+
+    // ========================================================================
+    // DRAW EVERY DETECTED HAND
+    // ========================================================================
 
     for (final hand in hands) {
-      final points = <Offset>[];
+      final points =
+          <Offset>[];
 
-      for (final landmark in hand.landmarks) {
-        double x = landmark.x;
-        final double y = landmark.y;
+      // ----------------------------------------------------------------------
+      // CREATE SCREEN POINTS
+      // ----------------------------------------------------------------------
 
-        if (mirror) {
-          x = 1.0 - x;
-        }
+      for (final landmark
+          in hand.landmarks) {
+        final dx =
+            (landmark.x - 0.5) *
+                logicalWidth;
+
+        final dy =
+            (landmark.y - 0.5) *
+                logicalHeight;
 
         points.add(
-          Offset(
-            x * size.width,
-            y * size.height,
-          ),
+          Offset(dx, dy),
         );
       }
 
-      // Draw bones first.
-      for (final connection in connections) {
-        final startIndex = connection[0];
-        final endIndex = connection[1];
+      // ----------------------------------------------------------------------
+      // DRAW CONNECTIONS
+      // ----------------------------------------------------------------------
 
-        if (startIndex >= points.length ||
-            endIndex >= points.length) {
+      for (final connection
+          in connections) {
+        final startIndex =
+            connection[0];
+
+        final endIndex =
+            connection[1];
+
+        if (startIndex >=
+                points.length ||
+            endIndex >=
+                points.length) {
           continue;
         }
 
         canvas.drawLine(
           points[startIndex],
           points[endIndex],
-          bonePaint,
+          linePaint,
         );
       }
 
-      // Draw landmark points.
-      for (final point in points) {
+      // ----------------------------------------------------------------------
+      // DRAW 21 LANDMARK POINTS
+      // ----------------------------------------------------------------------
+
+      for (final point
+          in points) {
         canvas.drawCircle(
           point,
-          7,
+          7 / scale,
           pointPaint,
         );
 
         canvas.drawCircle(
           point,
-          7,
+          7 / scale,
           pointBorderPaint,
         );
       }
     }
+
+    canvas.restore();
   }
 
   @override
   bool shouldRepaint(
-    covariant HandLandmarkPainter oldDelegate,
+    covariant HandLandmarkPainter
+        oldDelegate,
   ) {
-    return oldDelegate.hands != hands ||
-        oldDelegate.mirror != mirror;
+    return true;
   }
 }
