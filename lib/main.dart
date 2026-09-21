@@ -1,3 +1,5 @@
+import 'splash_screen.dart';
+
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -32,14 +34,16 @@ class HandSignApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Hand Sign Learner',
+      title: 'Hand Sign App',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
         colorSchemeSeed: Colors.indigo,
         scaffoldBackgroundColor: const Color(0xFFF6F7FB),
       ),
-      home: const CameraScreen(),
+      home: const SplashScreen(
+        nextScreen: CameraScreen(),
+      ),
     );
   }
 }
@@ -1245,15 +1249,6 @@ class _CameraScreenState extends State<CameraScreen> {
                     height: 24,
                   ),
 
-                  const Text(
-                    'Hand Sign Learner',
-                    style: TextStyle(
-                      fontSize: 26,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
-                  ),
-
                   const SizedBox(
                     height: 12,
                   ),
@@ -1280,6 +1275,7 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
         ),
       );
+      
     }
 
     // =========================================================================
@@ -1412,7 +1408,7 @@ class _CameraScreenState extends State<CameraScreen> {
                               .start,
                       children: [
                         Text(
-                          'Hand Sign Learner',
+                          'Hand Sign Recognition',
                           style: TextStyle(
                             color:
                                 Colors.white,
